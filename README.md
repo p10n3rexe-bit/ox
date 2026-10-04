@@ -7,7 +7,7 @@ The bot forwards Telegram text to the public Ox Alpha chat page at `https://oxal
 - A separate browser context keeps each Telegram user's page history isolated.
 - A single global queue sends requests one at a time and applies a minimum pause between them.
 - After 10 user messages in a chat, the bot clicks **New Chat** in the website UI.
-- `/new` starts a fresh website chat; `/reset` closes and clears that user's browser context.
+- `/new` and `/reset` start a fresh website chat while keeping the same browser context.
 - Session data is held in memory and is cleared when the bot process stops.
 - The bot does not rotate accounts, cookies, proxies, or network identities.
 

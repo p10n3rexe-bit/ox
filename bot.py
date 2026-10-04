@@ -112,11 +112,11 @@ async def new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    async with session_lock:
-        session = sessions.pop(user_id, None)
-    if session:
-        await session.context.close()
-    await update.message.reply_text("История этой сессии очищена.")
+    async with site_lock:
+        session = await get_session(user_id)
+        await start_new_chat(session.page)
+        session.turns = 0
+    await update.message.reply_text("Начал новый чат; браузерная сессия сохранена.")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
