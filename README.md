@@ -22,3 +22,9 @@ The bot forwards Telegram text to the public Ox Alpha chat page at `https://oxal
 6. Export the variables from `.env` in your shell and run `python bot.py`.
 
 The public chat page can change without notice. If its input, send button, or response markup changes, the selectors in `bot.py` may need an update.
+
+## Bothost deployment
+
+The standard Bothost Python build installs packages from `requirements.txt` but does not download Playwright browser binaries. This project includes a `Dockerfile` that installs Chromium and its Linux system dependencies during image build.
+
+In the Bothost dashboard, edit the bot, open **Дополнительные настройки**, enable **Использовать собственный Dockerfile**, then redeploy. Add the values from `.env.example` under the bot's environment variables; keep the Telegram token private.
