@@ -67,6 +67,7 @@ async def ask_site(session: UserSession, prompt: str) -> str:
     page = session.page
     assistant_messages = page.locator(".chat-area .msg.msg-assistant .prose")
     before = await assistant_messages.count()
+    previous_answer = (await assistant_messages.last.inner_text()).strip() if before else ""
 
     field = page.locator("textarea")
     await field.fill(prompt)
@@ -79,16 +80,28 @@ async def ask_site(session: UserSession, prompt: str) -> str:
         count = await assistant_messages.count()
         if count > before:
             answer = (await assistant_messages.last.inner_text()).strip()
-            sending = await page.get_by_role("button", name="Stop", exact=True).count()
-            thinking = await page.get_by_role("status").count()
-            if answer and sending == 0 and thinking == 0:
+        elif count and (await assistant_messages.last.inner_text()).strip() != previous_answer:
+            # Some versions of the site update the last assistant bubble in place
+            # instead of appending a new one.
+            answer = (await assistant_messages.last.inner_text()).strip()
+        else:
+            answer = ""
+
+        if answer:
+            stop_button = page.get_by_role("button", name="Stop", exact=True)
+            busy = await stop_button.count() > 0 and await stop_button.is_visible()
+            if not busy:
                 if answer == previous_text:
                     stable_polls += 1
                 else:
                     previous_text = answer
                     stable_polls = 0
-                if stable_polls >= 1:
+                # A short stability window avoids returning a partial streamed reply.
+                if stable_polls >= 3:
                     return answer
+            else:
+                previous_text = answer
+                stable_polls = 0
         await asyncio.sleep(0.35)
 
     raise TimeoutError("Ox Alpha did not finish a reply before the timeout")
@@ -147,7 +160,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         for chunk in chunks[1:]:
             await update.message.reply_text(chunk)
     except Exception as exc:
-        log.warning("Request failed for Telegram user %s: %s", user_id, type(exc).__name__)
+        log.exception("Request failed for Telegram user %s", user_id)
         await status.edit_text(
             "Не удалось получить ответ от веб-чата. Попробуй ещё раз или начни новый чат командой /new."
         )
