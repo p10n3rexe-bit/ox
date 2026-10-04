@@ -1,17 +1,24 @@
-# Telegram bot for Ox Alpha (official API adapter)
+# Ox Alpha Telegram Bot
 
-This starter bot forwards Telegram messages to an **official, authorized, OpenAI-compatible Ox Alpha API endpoint** and returns the answer. It does not automate the oxalpha.com website, extract browser session tokens, create accounts, rotate identities, or evade service limits.
+The bot forwards Telegram text to the public Ox Alpha chat page at `https://oxalpha.com/chat` through its visible web interface, then returns the completed answer. It does not require an Ox Alpha account or API key.
 
-## Current integration status
+## Chat behavior
 
-Ox Alpha's public pages describe a no-login web chat. No public API documentation or supported bot endpoint was found, so the API URL is intentionally left unset. The bot will not connect to `oxalpha.com/chat` until the service provides an official API endpoint or explicitly authorizes an integration. Do not substitute private frontend endpoints or browser cookies.
+- A separate browser context keeps each Telegram user's page history isolated.
+- A single global queue sends requests one at a time and applies a minimum pause between them.
+- After 10 user messages in a chat, the bot clicks **New Chat** in the website UI.
+- `/new` starts a fresh website chat; `/reset` closes and clears that user's browser context.
+- Session data is held in memory and is cleared when the bot process stops.
+- The bot does not rotate accounts, cookies, proxies, or network identities.
 
 ## Run
 
-1. Install Python 3.10+.
-2. `python -m venv .venv` and activate it.
-3. `pip install -r requirements.txt`
-4. Copy `.env.example` to `.env`, fill in the Telegram token and documented API settings.
-5. Export the variables from `.env` in your shell, then run `python bot.py`.
+1. Install Python 3.10 or newer.
+2. Create and activate a virtual environment: `python -m venv .venv`.
+3. Install dependencies: `pip install -r requirements.txt`.
+4. Install Chromium for Playwright: `python -m playwright install chromium`.
+   On Linux systems missing browser libraries, use `python -m playwright install --with-deps chromium`.
+5. Copy `.env.example` to `.env`, then set `TELEGRAM_BOT_TOKEN` from BotFather.
+6. Export the variables from `.env` in your shell and run `python bot.py`.
 
-Each Telegram user has an isolated in-memory chat. `/new` starts a chat; `/reset` removes its context. At `MAX_TURNS_PER_CHAT` user turns, the bot starts a clean chat to honor the stated ten-message limit. Restarting the process clears conversation history. Add a persistent database only if desired and disclose the retention policy to users.
+The public chat page can change without notice. If its input, send button, or response markup changes, the selectors in `bot.py` may need an update.

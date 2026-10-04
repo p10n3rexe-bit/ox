@@ -1,100 +1,183 @@
 import asyncio
-import json
+import logging
 import os
-import urllib.error
-import urllib.request
-from collections import defaultdict
+import time
+from dataclasses import dataclass
+
+from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-API_URL = os.environ.get("OXALPHA_API_URL", "").strip()
-API_KEY = os.environ.get("OXALPHA_API_KEY", "").strip()
-MODEL = os.environ.get("OXALPHA_MODEL", "ox-alpha")
-MAX_TURNS = int(os.environ.get("MAX_TURNS_PER_CHAT", "10"))
+CHAT_URL = os.environ.get("OXALPHA_CHAT_URL", "https://oxalpha.com/chat")
+MAX_TURNS = max(1, int(os.environ.get("MAX_TURNS_PER_CHAT", "10")))
+REPLY_TIMEOUT = max(30, int(os.environ.get("SITE_REPLY_TIMEOUT_SECONDS", "180")))
+MIN_REQUEST_INTERVAL = max(0.0, float(os.environ.get("MIN_REQUEST_INTERVAL_SECONDS", "2")))
 
-# In-memory state: process restart clears chats. Each Telegram user gets an
-# isolated conversation; after MAX_TURNS, context is reset for a fresh chat.
-conversations = defaultdict(lambda: {"messages": [], "turns": 0})
-locks = defaultdict(asyncio.Lock)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("oxalpha-telegram-bot")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+@dataclass
+class UserSession:
+    context: BrowserContext
+    page: Page
+    turns: int = 0
+
+
+playwright = None
+browser: Browser | None = None
+sessions: dict[int, UserSession] = {}
+session_lock = asyncio.Lock()
+site_lock = asyncio.Lock()
+last_site_request = 0.0
+
+
+async def get_session(user_id: int) -> UserSession:
+    async with session_lock:
+        session = sessions.get(user_id)
+        if session:
+            return session
+        if browser is None:
+            raise RuntimeError("Browser is not initialized")
+        # One isolated browser context per Telegram user prevents chat history
+        # from being shared. No accounts, proxies, or identity rotation are used.
+        context = await browser.new_context()
+        page = await context.new_page()
+        await page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=60000)
+        await page.locator("textarea").wait_for(state="visible", timeout=60000)
+        session = UserSession(context=context, page=page)
+        sessions[user_id] = session
+        return session
+
+
+async def start_new_chat(page: Page) -> None:
+    new_chat = page.get_by_role("button", name="New Chat", exact=True)
+    if await new_chat.count() == 0:
+        expand = page.get_by_role("button", name="Expand", exact=True)
+        if await expand.count():
+            await expand.click()
+    await new_chat.wait_for(state="visible", timeout=10000)
+    await new_chat.click()
+    await page.locator("textarea").wait_for(state="visible", timeout=10000)
+
+
+async def ask_site(session: UserSession, prompt: str) -> str:
+    global last_site_request
+    page = session.page
+    assistant_messages = page.locator(".chat-area .msg.msg-assistant .prose")
+    before = await assistant_messages.count()
+
+    field = page.locator("textarea")
+    await field.fill(prompt)
+    await page.get_by_role("button", name="Send", exact=True).click()
+
+    deadline = time.monotonic() + REPLY_TIMEOUT
+    previous_text = ""
+    stable_polls = 0
+    while time.monotonic() < deadline:
+        count = await assistant_messages.count()
+        if count > before:
+            answer = (await assistant_messages.last.inner_text()).strip()
+            sending = await page.get_by_role("button", name="Stop", exact=True).count()
+            thinking = await page.get_by_role("status").count()
+            if answer and sending == 0 and thinking == 0:
+                if answer == previous_text:
+                    stable_polls += 1
+                else:
+                    previous_text = answer
+                    stable_polls = 0
+                if stable_polls >= 1:
+                    return answer
+        await asyncio.sleep(0.35)
+
+    raise TimeoutError("Ox Alpha did not finish a reply before the timeout")
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Привет! Напиши сообщение — я передам его подключённому Ox Alpha API.\n"
-        "Команды: /new — начать новый чат, /reset — удалить текущий контекст."
+        "Напиши сообщение — передам его в веб-чат Ox Alpha.\n"
+        "Команды: /new — новый чат, /reset — очистить историю этого Telegram-чата."
     )
 
-async def new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conversations.pop(update.effective_user.id, None)
-    await update.message.reply_text("Новый чат начат.")
 
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conversations.pop(update.effective_user.id, None)
-    await update.message.reply_text("Контекст удалён.")
-
-async def request_model(messages):
-    if not API_URL:
-        raise RuntimeError("OXALPHA_API_URL не настроен: нужен официальный API endpoint Ox Alpha.")
-    payload = json.dumps({"model": MODEL, "messages": messages}).encode()
-    headers = {"Content-Type": "application/json"}
-    if API_KEY:
-        headers["Authorization"] = f"Bearer {API_KEY}"
-    req = urllib.request.Request(API_URL, data=payload, headers=headers, method="POST")
-
-    def send():
-        with urllib.request.urlopen(req, timeout=180) as response:
-            return json.loads(response.read().decode())
-    data = await asyncio.to_thread(send)
-    # OpenAI-compatible chat completions response.
-    return data["choices"][0]["message"]["content"]
-
-async def answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def new_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    text = update.message.text or ""
-    async with locks[user_id]:
-        state = conversations[user_id]
-        if state["turns"] >= MAX_TURNS:
-            state = {"messages": [], "turns": 0}
-            conversations[user_id] = state
-            await update.message.reply_text("Достигнут лимит сообщений в этом чате. Начинаю новый чат.")
-        state["messages"].append({"role": "user", "content": text})
-        status = await update.message.reply_text("Думаю…")
-        try:
-            result = await request_model(state["messages"])
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode(errors="replace")[:500]
-            await status.edit_text(f"API вернул ошибку {e.code}: {detail}")
-            state["messages"].pop()
-            return
-        except Exception as e:
-            await status.edit_text(f"Не удалось получить ответ: {e}")
-            state["messages"].pop()
-            return
-        state["messages"].append({"role": "assistant", "content": result})
-        state["turns"] += 1
-        # Telegram message limit; split safely into chunks.
-        chunks = [result[i:i+4000] for i in range(0, len(result), 4000)] or ["(пустой ответ)"]
+    async with site_lock:
+        session = await get_session(user_id)
+        await start_new_chat(session.page)
+        session.turns = 0
+    await update.message.reply_text("Начал новый чат Ox Alpha.")
+
+
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    async with session_lock:
+        session = sessions.pop(user_id, None)
+    if session:
+        await session.context.close()
+    await update.message.reply_text("История этой сессии очищена.")
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    prompt = update.message.text or ""
+    if not prompt.strip():
+        return
+
+    status = await update.message.reply_text("Передаю запрос в Ox Alpha…")
+    try:
+        async with site_lock:
+            session = await get_session(user_id)
+            if session.turns >= MAX_TURNS:
+                await start_new_chat(session.page)
+                session.turns = 0
+                await status.edit_text("Начал новый чат после 10 сообщений. Жду ответ…")
+
+            delay = MIN_REQUEST_INTERVAL - (time.monotonic() - last_site_request)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            last_site_request = time.monotonic()
+            response = await ask_site(session, prompt)
+            session.turns += 1
+
+        chunks = [response[i:i + 4000] for i in range(0, len(response), 4000)] or ["(пустой ответ)"]
         await status.edit_text(chunks[0])
         for chunk in chunks[1:]:
             await update.message.reply_text(chunk)
+    except Exception as exc:
+        log.warning("Request failed for Telegram user %s: %s", user_id, type(exc).__name__)
+        await status.edit_text(
+            "Не удалось получить ответ от веб-чата. Попробуй ещё раз или начни новый чат командой /new."
+        )
 
-async def main():
-    if not API_URL:
-        print("Warning: configure OXALPHA_API_URL with an official supported endpoint before use.")
-    app = Application.builder().token(BOT_TOKEN).build()
+
+async def post_init(application: Application) -> None:
+    global playwright, browser
+    playwright = await async_playwright().start()
+    browser = await playwright.chromium.launch(headless=True, args=["--no-sandbox"])
+    log.info("Ox Alpha browser session is ready")
+
+
+async def post_shutdown(application: Application) -> None:
+    global playwright, browser
+    for session in list(sessions.values()):
+        await session.context.close()
+    sessions.clear()
+    if browser:
+        await browser.close()
+    if playwright:
+        await playwright.stop()
+
+
+def main() -> None:
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("new", new_chat))
     app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, answer))
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    try:
-        await asyncio.Event().wait()
-    finally:
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.run_polling()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
