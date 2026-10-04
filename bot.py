@@ -120,6 +120,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global last_site_request
     user_id = update.effective_user.id
     prompt = update.message.text or ""
     if not prompt.strip():
